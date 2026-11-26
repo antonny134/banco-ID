@@ -608,7 +608,7 @@ def abrir_perfil_publico(perfil_id: str):
     usuarios = garantir_perfil_ids()
     if not any(dados.get("perfil_id") == perfil_id for dados in usuarios.values()):
         raise HTTPException(404, "Perfil não encontrado.")
-    return FileResponse(BASE_DIR / "paginas" / "perfil.html")
+    return FileResponse(BASE_DIR / "perfil.html")
 
 
 if __name__ == "__main__":
