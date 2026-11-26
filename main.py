@@ -55,10 +55,13 @@ MAX_PDFS_POR_USUARIO = int(cfg("MAX_PDFS_POR_USUARIO", "100"))
 ORIGENS_PERMITIDAS = [
     o.strip() for o in cfg("ALLOWED_ORIGINS", API_BASE_URL).split(",") if o.strip()
 ]
-PDFS_DIR = BASE_DIR / "pdfs"
-DADOS_DIR = BASE_DIR / "dados"
-PDFS_DIR.mkdir(exist_ok=True)
-DADOS_DIR.mkdir(exist_ok=True)
+
+# Na Vercel o disco e somente leitura (exceto /tmp, que e temporario)
+DATA_ROOT = Path("/tmp") if os.environ.get("VERCEL") else BASE_DIR
+PDFS_DIR = DATA_ROOT / "pdfs"
+DADOS_DIR = DATA_ROOT / "dados"
+PDFS_DIR.mkdir(parents=True, exist_ok=True)
+DADOS_DIR.mkdir(parents=True, exist_ok=True)
 
 USUARIOS_JSON = DADOS_DIR / "usuarios.json"  # contas (senha só em hash)
 SESSOES_JSON = DADOS_DIR / "sessoes.json"  # tokens de login (só o hash)
@@ -97,8 +100,8 @@ async def cabecalhos_de_seguranca(request: Request, chamada):
 
 
 PAGINAS_DIR = BASE_DIR / "paginas"
-PAGINAS_DIR.mkdir(exist_ok=True)
-app.mount("/paginas", StaticFiles(directory=PAGINAS_DIR), name="paginas")
+if PAGINAS_DIR.is_dir():
+    app.mount("/paginas", StaticFiles(directory=PAGINAS_DIR), name="paginas")
 
 
 # ---------- Modelos ----------

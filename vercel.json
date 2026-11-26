@@ -1,16 +1,12 @@
 {
-  "version": 2,
   "builds": [
     {
       "src": "main.py",
       "use": "@vercel/python",
       "config": {
-        "maxLambdaSize": "50mb",
         "includeFiles": ["index.html", "perfil.html", "paginas/**"]
       }
     }
   ],
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/main.py" }
-  ]
+  "routes": [{ "src": "/(.*)", "dest": "main.py" }]
 }
