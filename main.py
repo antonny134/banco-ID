@@ -96,7 +96,9 @@ async def cabecalhos_de_seguranca(request: Request, chamada):
     return resposta
 
 
-app.mount("/paginas", StaticFiles(directory=BASE_DIR / "paginas"), name="paginas")
+PAGINAS_DIR = BASE_DIR / "paginas"
+PAGINAS_DIR.mkdir(exist_ok=True)
+app.mount("/paginas", StaticFiles(directory=PAGINAS_DIR), name="paginas")
 
 
 # ---------- Modelos ----------
