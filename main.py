@@ -100,7 +100,7 @@ app.add_middleware(
     allow_origins=["*"],
 )
 
-
+DADOS_DE_USUARIOS = []
 
 @app.middleware("http")
 async def cabecalhos_de_seguranca(request: Request, chamada):
@@ -342,6 +342,10 @@ def garantir_perfil_ids() -> dict:
                 alterado = True
         if alterado:
             salvar_json(USUARIOS_JSON, usuarios)
+        DADOS_DE_USUARIOS[:] = [
+            {"chave": chave, **deepcopy(dados)}
+            for chave, dados in usuarios.items()
+        ]
     return usuarios
 
 
@@ -403,6 +407,7 @@ def cadastrar(corpo: Cadastro, request: Request):
             "criado": agora_iso(),
         }
         salvar_json(USUARIOS_JSON, usuarios)
+    garantir_perfil_ids()
     return {"nome": nome}
 
 
@@ -414,7 +419,15 @@ def entrar(corpo: Login, request: Request):
     msg = "Muitas tentativas. Aguarde alguns minutos."
     exigir_limite(k_conta, 5, 900, msg)  # 5 erros / 15 min por IP+conta
     exigir_limite(k_ip, 30, 900, msg)  # 30 erros / 15 min por IP
-    usuario = garantir_perfil_ids().get(chave_nome)
+    garantir_perfil_ids()
+    usuario = next(
+        (
+            dados
+            for dados in DADOS_DE_USUARIOS
+            if dados.get("chave") == chave_nome
+        ),
+        None,
+    )
     salt = bytes.fromhex(usuario["salt"]) if usuario else b"\0" * 16
     calculado = gerar_hash(corpo.senha, salt)  # sempre calcula (evita medir tempo)
     if not usuario or not hmac.compare_digest(calculado, usuario["hash"]):
