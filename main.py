@@ -52,9 +52,6 @@ MAX_MB = float(cfg("MAX_UPLOAD_MB", "10"))
 MAX_BYTES = int(MAX_MB * 1024 * 1024)
 DURACAO_SESSAO = int(cfg("SESSION_DURATION_DAYS", "30")) * 24 * 3600
 MAX_PDFS_POR_USUARIO = int(cfg("MAX_PDFS_POR_USUARIO", "100"))
-ORIGENS_PERMITIDAS = [
-    o.strip() for o in cfg("ALLOWED_ORIGINS", API_BASE_URL).split(",") if o.strip()
-]
 
 # Na Vercel o disco e somente leitura (exceto /tmp, que e temporario)
 DATA_ROOT = Path("/tmp") if os.environ.get("VERCEL") else BASE_DIR
@@ -78,7 +75,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
-    allow_origins=ORIGENS_PERMITIDAS,
+    allow_origins=["*"],
 )
 
 
