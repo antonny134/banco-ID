@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -9,9 +10,13 @@ import time
 import unicodedata
 import uuid
 from collections import deque
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
+from urllib.error import HTTPError
+from urllib.parse import quote, urlencode
+from urllib.request import Request as URLRequest, urlopen
 
 import uvicorn as uvicon
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
@@ -53,12 +58,28 @@ MAX_BYTES = int(MAX_MB * 1024 * 1024)
 DURACAO_SESSAO = int(cfg("SESSION_DURATION_DAYS", "30")) * 24 * 3600
 MAX_PDFS_POR_USUARIO = int(cfg("MAX_PDFS_POR_USUARIO", "100"))
 
-# Na Vercel o disco e somente leitura (exceto /tmp, que e temporario)
-DATA_ROOT = Path("/tmp") if os.environ.get("VERCEL") else BASE_DIR
+SUPABASE_URL = cfg("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = cfg("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_STORAGE_BUCKET = cfg("SUPABASE_STORAGE_BUCKET", "profhub-pdfs")
+USAR_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+if bool(SUPABASE_URL) != bool(SUPABASE_SERVICE_ROLE_KEY):
+    raise RuntimeError(
+        "Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY juntos."
+    )
+if os.environ.get("VERCEL") and not USAR_SUPABASE:
+    raise RuntimeError(
+        "Na Vercel, configure Supabase para evitar perda de dados em disco temporário."
+    )
+
+# O armazenamento local e adequado apenas para desenvolvimento; /tmp na Vercel
+# nao e persistente nem compartilhado entre instancias.
+DATA_ROOT = BASE_DIR
 PDFS_DIR = DATA_ROOT / "pdfs"
 DADOS_DIR = DATA_ROOT / "dados"
-PDFS_DIR.mkdir(parents=True, exist_ok=True)
-DADOS_DIR.mkdir(parents=True, exist_ok=True)
+if not USAR_SUPABASE:
+    PDFS_DIR.mkdir(parents=True, exist_ok=True)
+    DADOS_DIR.mkdir(parents=True, exist_ok=True)
 
 USUARIOS_JSON = DADOS_DIR / "usuarios.json"  # contas (senha só em hash)
 SESSOES_JSON = DADOS_DIR / "sessoes.json"  # tokens de login (só o hash)
@@ -67,6 +88,7 @@ REACOES_JSON = DADOS_DIR / "reacoes.json"  # votos por PDF e conta
 
 ITERACOES_HASH = 200_000
 trava = threading.RLock()
+_estado_lido = threading.local()
 
 # sem /docs e /openapi.json publicos
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -122,6 +144,15 @@ def agora_iso() -> str:
 
 
 def ler_json(caminho: Path, padrao):
+    if USAR_SUPABASE:
+        chave = caminho.stem
+        consulta = urlencode({"key": f"eq.{chave}", "select": "value"})
+        linhas = requisicao_supabase(f"/rest/v1/profehub_state?{consulta}")
+        valor = linhas[0]["value"] if linhas else deepcopy(padrao)
+        if not hasattr(_estado_lido, "valores"):
+            _estado_lido.valores = {}
+        _estado_lido.valores[chave] = deepcopy(valor)
+        return valor
     try:
         return json.loads(caminho.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
@@ -129,11 +160,110 @@ def ler_json(caminho: Path, padrao):
 
 
 def salvar_json(caminho: Path, dados) -> None:
+    if USAR_SUPABASE:
+        chave = caminho.stem
+        anteriores = getattr(_estado_lido, "valores", {}).get(chave, {})
+        alterados = {
+            item: valor
+            for item, valor in dados.items()
+            if item not in anteriores or anteriores[item] != valor
+        }
+        removidos = [item for item in anteriores if item not in dados]
+        if alterados or removidos:
+            requisicao_supabase(
+                "/rest/v1/rpc/profehub_update_state",
+                metodo="POST",
+                corpo={
+                    "p_key": chave,
+                    "p_changes": alterados,
+                    "p_deletions": removidos,
+                },
+            )
+        if not hasattr(_estado_lido, "valores"):
+            _estado_lido.valores = {}
+        _estado_lido.valores[chave] = deepcopy(dados)
+        return
     temporario = caminho.with_suffix(".tmp")
     temporario.write_text(
         json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     temporario.replace(caminho)
+
+
+def requisicao_supabase(
+    caminho: str,
+    metodo: str = "GET",
+    corpo=None,
+    conteudo: Optional[bytes] = None,
+    tipo_conteudo: str = "application/json",
+    resposta_json: bool = True,
+):
+    dados = conteudo
+    if corpo is not None:
+        dados = json.dumps(corpo, ensure_ascii=False).encode("utf-8")
+    cabecalhos = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": tipo_conteudo,
+    }
+    if caminho.startswith("/rest/v1/rpc/"):
+        cabecalhos["Prefer"] = "return=minimal"
+    requisicao = URLRequest(
+        f"{SUPABASE_URL}{caminho}",
+        data=dados,
+        headers=cabecalhos,
+        method=metodo,
+    )
+    try:
+        with urlopen(requisicao, timeout=20) as resposta:
+            corpo_resposta = resposta.read()
+    except HTTPError as erro:
+        raise RuntimeError(f"Supabase respondeu HTTP {erro.code}.") from erro
+    if not corpo_resposta:
+        return None
+    return (
+        json.loads(corpo_resposta.decode("utf-8"))
+        if resposta_json
+        else corpo_resposta
+    )
+
+
+def caminho_storage_pdf(pdf_id: str) -> str:
+    bucket = quote(SUPABASE_STORAGE_BUCKET, safe="")
+    objeto = quote(f"{pdf_id}.pdf", safe="")
+    return f"/storage/v1/object/{bucket}/{objeto}"
+
+
+def pdf_existe(pdf_id: str) -> bool:
+    return USAR_SUPABASE or (PDFS_DIR / f"{pdf_id}.pdf").is_file()
+
+
+def persistir_pdf(pdf_id: str, conteudo: bytes, meta: dict, chave_usuario: str) -> None:
+    with trava:
+        pdfs = ler_json(PDFS_JSON, {})
+        ja_enviados = sum(
+            1 for item in pdfs.values() if item.get("dono") == chave_usuario
+        )
+        if ja_enviados >= MAX_PDFS_POR_USUARIO:
+            raise HTTPException(
+                409, f"Limite de {MAX_PDFS_POR_USUARIO} PDFs atingido."
+            )
+
+        if USAR_SUPABASE:
+            requisicao_supabase(
+                caminho_storage_pdf(pdf_id),
+                metodo="POST",
+                conteudo=conteudo,
+                tipo_conteudo="application/pdf",
+            )
+        else:
+            caminho_final = PDFS_DIR / f"{pdf_id}.pdf"
+            caminho_temporario = PDFS_DIR / f".{pdf_id}.tmp"
+            caminho_temporario.write_bytes(conteudo)
+            caminho_temporario.replace(caminho_final)
+
+        pdfs[pdf_id] = meta
+        salvar_json(PDFS_JSON, pdfs)
 
 
 def normalizar_nome(nome: str) -> str:
@@ -329,8 +459,8 @@ def carregar_pdf(pdf_id: str):
     if not re.fullmatch(r"[a-f0-9]{32}", pdf_id):
         raise HTTPException(400, "ID inválido")
     meta = ler_json(PDFS_JSON, {}).get(pdf_id)
-    caminho = PDFS_DIR / f"{pdf_id}.pdf"
-    if not meta or not caminho.exists():
+    caminho = pdf_id if USAR_SUPABASE else PDFS_DIR / f"{pdf_id}.pdf"
+    if not meta or not pdf_existe(pdf_id):
         raise HTTPException(404, "PDF não encontrado")
     return meta, caminho
 
@@ -343,7 +473,22 @@ def pdf_do_usuario(pdf_id: str, usuario: dict):
     return meta, caminho
 
 
-def enviar_arquivo(caminho: Path, meta: dict) -> FileResponse:
+def enviar_arquivo(caminho, meta: dict):
+    if USAR_SUPABASE:
+        conteudo = requisicao_supabase(
+            caminho_storage_pdf(caminho),
+            tipo_conteudo="application/pdf",
+            resposta_json=False,
+        )
+        return Response(
+            content=conteudo,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": (
+                    f"inline; filename*=UTF-8''{quote(meta['nome'], safe='')}"
+                )
+            },
+        )
     return FileResponse(
         caminho,
         media_type="application/pdf",
@@ -397,7 +542,7 @@ def listar_publicos(
         for pdf_id, meta in pdfs.items()
         if meta.get("compartilhado")
         and (filtro_dono is None or meta["dono"] == filtro_dono)
-        and (PDFS_DIR / f"{pdf_id}.pdf").exists()
+        and pdf_existe(pdf_id)
     ]
     itens.sort(key=lambda item: item["data"], reverse=True)
     return itens
@@ -428,12 +573,6 @@ async def enviar_pdf(
     if not nome.lower().endswith(".pdf"):
         raise HTTPException(400, "Envie um arquivo .pdf")
 
-    ja_enviados = sum(
-        1 for m in ler_json(PDFS_JSON, {}).values() if m.get("dono") == usuario["chave"]
-    )
-    if ja_enviados >= MAX_PDFS_POR_USUARIO:
-        raise HTTPException(409, f"Limite de {MAX_PDFS_POR_USUARIO} PDFs atingido.")
-
     conteudo = bytearray()
     while bloco := await arquivo.read(1024 * 1024):  # le aos poucos
         conteudo += bloco
@@ -445,21 +584,16 @@ async def enviar_pdf(
 
     nome_seguro = re.sub(r"[^\w.\- ]", "_", nome)
     pdf_id = uuid.uuid4().hex
-    caminho_final = PDFS_DIR / f"{pdf_id}.pdf"
-    caminho_temporario = PDFS_DIR / f".{pdf_id}.tmp"
-    caminho_temporario.write_bytes(conteudo)
-    caminho_temporario.replace(caminho_final)
-
-    with trava:
-        pdfs = ler_json(PDFS_JSON, {})
-        pdfs[pdf_id] = {
-            "dono": usuario["chave"],
-            "nome": nome_seguro,
-            "compartilhado": False,
-            "data": agora_iso(),
-            "data_compartilhado": None,
-        }
-        salvar_json(PDFS_JSON, pdfs)
+    meta = {
+        "dono": usuario["chave"],
+        "nome": nome_seguro,
+        "compartilhado": False,
+        "data": agora_iso(),
+        "data_compartilhado": None,
+    }
+    await asyncio.to_thread(
+        persistir_pdf, pdf_id, bytes(conteudo), meta, usuario["chave"]
+    )
     return {"id": pdf_id, "nome": nome_seguro, "compartilhado": False}
 
 
@@ -475,7 +609,7 @@ def listar_meus_pdfs(usuario: dict = Depends(usuario_atual)):
         }
         for pdf_id, meta in pdfs.items()
         if meta["dono"] == usuario["chave"]
-        and (PDFS_DIR / f"{pdf_id}.pdf").exists()
+        and pdf_existe(pdf_id)
     ]
     meus.sort(key=lambda item: item["data"], reverse=True)
     return meus
@@ -490,7 +624,14 @@ def abrir_meu_pdf(pdf_id: str, usuario: dict = Depends(usuario_atual)):
 @app.delete("/pdfs/{pdf_id}")
 def apagar_pdf(pdf_id: str, usuario: dict = Depends(usuario_atual)):
     _, caminho = pdf_do_usuario(pdf_id, usuario)
-    caminho.unlink(missing_ok=True)
+    if USAR_SUPABASE:
+        requisicao_supabase(
+            f"/storage/v1/object/{quote(SUPABASE_STORAGE_BUCKET, safe='')}",
+            metodo="DELETE",
+            corpo={"prefixes": [f"{pdf_id}.pdf"]},
+        )
+    else:
+        caminho.unlink(missing_ok=True)
     with trava:
         pdfs = ler_json(PDFS_JSON, {})
         if pdfs.pop(pdf_id, None) is not None:
